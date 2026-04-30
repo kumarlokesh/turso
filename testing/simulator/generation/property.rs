@@ -65,11 +65,13 @@ impl Property {
                     };
                     let query = Query::arbitrary_from(rng, ctx, query_distr);
                     let table_name = insert.table();
-                    let table = ctx
-                        .tables()
-                        .iter()
-                        .find(|table| table.name == table_name)
-                        .unwrap();
+                    let Some(table) = Self::table_with_name(ctx, table_name) else {
+                        tracing::info!(
+                            property = "InsertValuesSelect",
+                            "extensional query generation exhausted max attempts; falling back to SELECT TRUE"
+                        );
+                        return None;
+                    };
 
                     let partial_rows = insert.rows();
                     let partial_row = &partial_rows[*row_index];
@@ -127,12 +129,13 @@ impl Property {
                         unreachable!()
                     };
 
-                    let table_name = create.table.name.clone();
-                    let table = ctx
-                        .tables()
-                        .iter()
-                        .find(|table| table.name == table_name)
-                        .unwrap();
+                    let Some(table) = Self::table_with_name(ctx, &create.table.name) else {
+                        tracing::info!(
+                            property = "DoubleCreateFailure",
+                            "extensional query generation exhausted max attempts; falling back to SELECT TRUE"
+                        );
+                        return None;
+                    };
 
                     let query = Query::arbitrary_from(rng, ctx, query_distr);
                     match &query {
@@ -157,11 +160,9 @@ impl Property {
                 // - [x] There will be no errors in the middle interactions. (this constraint is impossible to check, so this is just best effort)
                 // - [x] A row that holds for the predicate will not be inserted.
                 // - [x] The table `t` will not be renamed, dropped, or altered.
-                // - [x] Under MVCC, no DDL anywhere: `PlanGenerator::next`
-                //   injects COMMITs on every open `BEGIN CONCURRENT` before it
-                //   runs DDL, which closes this property's transaction and
-                //   lets the final SELECT see rows committed by other
-                //   connections — breaking the property's invariant.
+                // - [x] Under MVCC, there will be no DDL (this is a best effort, because concurrent
+                //       transactions could still drop the table, in which case this property will
+                //       be skipped).
 
                 |rng, ctx, query_distr, property| {
                     let Property::DeleteSelect {
@@ -174,15 +175,15 @@ impl Property {
                     };
 
                     let table_name = table_name.clone();
-                    let table = ctx
-                        .tables()
-                        .iter()
-                        .find(|table| table.name == table_name)
-                        .unwrap();
-                    let query = Query::arbitrary_from(rng, ctx, query_distr);
-                    if ctx.opts().mvcc && query.is_ddl() {
+
+                    let Some(table) = Self::table_with_name(ctx, &table_name) else {
+                        tracing::info!(
+                            property = "DeleteSelect",
+                            "extensional query generation exhausted max attempts; falling back to SELECT TRUE"
+                        );
                         return None;
-                    }
+                    };
+                    let query = Query::arbitrary_from(rng, ctx, query_distr);
                     match &query {
                         Query::Insert(Insert::Values {
                             table: t, values, ..
@@ -221,6 +222,10 @@ impl Property {
                         }
                         Query::AlterTable(AlterTable { table_name: t, .. }) if *t == table.name => {
                             // Cannot alter the same table
+                            None
+                        }
+                        _ if ctx.opts().mvcc && query.is_ddl() => {
+                            // No DDL in MVCC
                             None
                         }
                         _ => Some(query),
@@ -279,6 +284,20 @@ impl Property {
             | Property::AllTableHaveExpectedContent { .. } => {
                 unreachable!("No extensional queries")
             }
+        }
+    }
+
+    fn table_with_name<'a, G>(ctx: &'a G, table_name: &str) -> Option<&'a Table>
+    where
+        G: GenerationContext,
+    {
+        let table = ctx.tables().iter().find(|table| table.name == table_name);
+        if ctx.opts().mvcc {
+            // Under MVCC, due to difficulties in tracking concurrent state, the table
+            // could be absent.
+            table
+        } else {
+            Some(table.unwrap())
         }
     }
 
@@ -401,9 +420,9 @@ impl Property {
                         None,
                         Distinctness::All,
                     );
-                    builders.push(InteractionBuilder::with_interaction(InteractionType::Query(
-                        Query::Select(select),
-                    )));
+                    builders.push(InteractionBuilder::with_interaction(
+                        InteractionType::Query(Query::Select(select)),
+                    ));
                 }
 
                 let columns_for_assertion = columns.clone();
@@ -426,8 +445,11 @@ impl Property {
                                 "table {table_for_assertion} disappeared from model"
                             )));
                         };
-                        let model_cols: Vec<&str> =
-                            model_table.columns.iter().map(|c| c.name.as_str()).collect();
+                        let model_cols: Vec<&str> = model_table
+                            .columns
+                            .iter()
+                            .map(|c| c.name.as_str())
+                            .collect();
 
                         let start = stack.len() - n;
                         for (i, col_name) in columns_for_assertion.iter().enumerate() {
