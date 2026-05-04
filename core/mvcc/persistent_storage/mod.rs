@@ -148,6 +148,7 @@ impl DurableStorage for Storage {
         log_record.op_count = log_record.op_count.checked_add(1).ok_or_else(|| {
             LimboError::InternalError("logical log op_count exceeds u32".to_string())
         })?;
+        log_record.sync_row_versions.push(row_version.clone());
         Ok(())
     }
 
@@ -165,6 +166,7 @@ impl DurableStorage for Storage {
         log_record.op_count = log_record.op_count.checked_add(1).ok_or_else(|| {
             LimboError::InternalError("logical log op_count exceeds u32".to_string())
         })?;
+        log_record.sync_header = Some(*header);
         Ok(())
     }
 
