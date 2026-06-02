@@ -1945,8 +1945,6 @@ impl Connection {
             match value {
                 Some(value) => {
                     metadata.insert(key, value);
-                    self.portable_logical_changes_enabled
-                        .store(true, Ordering::Release);
                 }
                 None => {
                     metadata.remove(&key);
