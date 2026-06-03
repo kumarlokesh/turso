@@ -16,6 +16,30 @@ export type BatchStatement = string | {
   args?: any[] | Record<string, any>;
 };
 
+/**
+ * Shapes a raw per-statement result from `session.batch()` into a libSQL
+ * `ResultSet`: the rowid becomes a BigInt and a JSON-friendly `toJSON()`
+ * (which renders the rowid as a string, since JSON has no BigInt) is added.
+ */
+function toResultSet(result: any): any {
+  return {
+    columns: result.columns ?? [],
+    columnTypes: result.columnTypes ?? [],
+    rows: result.rows ?? [],
+    rowsAffected: result.rowsAffected ?? 0,
+    lastInsertRowid: result.lastInsertRowid != null ? BigInt(result.lastInsertRowid) : undefined,
+    toJSON() {
+      return {
+        columns: this.columns,
+        columnTypes: this.columnTypes,
+        rows: this.rows,
+        rowsAffected: this.rowsAffected,
+        lastInsertRowid: this.lastInsertRowid?.toString(),
+      };
+    },
+  };
+}
+
 
 /**
  * A connection to a Turso database.
@@ -267,8 +291,10 @@ export class Connection {
    *   values as `connection.transaction(...)` variants: `"deferred"`,
    *   `"immediate"`, `"exclusive"`, `"concurrent"`. Ignored when already
    *   inside a transaction.
-   * @returns An object with `rowsAffected` (sum of affected rows) and
-   *   `lastInsertRowid` (rowid of the last successful insert).
+   * @returns An array of `ResultSet`s — one per input statement, in order —
+   *   matching the libSQL client contract. Each `ResultSet` carries that
+   *   statement's `columns`, `columnTypes`, `rows`, `rowsAffected`, and
+   *   `lastInsertRowid`.
    *
    * @example
    * // Plain SQL strings (non-atomic).
@@ -309,7 +335,10 @@ export class Connection {
       // already opened a transaction on this stream; emitting another
       // `BEGIN` step would fail, so ignore the user-supplied mode.
       const effectiveMode = this._inTransaction ? undefined : mode;
-      return await this.session.batch(statements, effectiveMode, queryOptions);
+      const results = await this.session.batch(statements, effectiveMode, queryOptions, this.defaultSafeIntegerMode);
+      // Surface each statement's result as a libSQL `ResultSet`: rowid as a
+      // BigInt and a JSON-friendly `toJSON()`.
+      return results.map((result: any) => toResultSet(result));
     } finally {
       this.execLock.release();
     }

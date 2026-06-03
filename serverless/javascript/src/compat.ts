@@ -283,15 +283,22 @@ class LibSQLClient implements Client {
         throw new LibsqlError("Client is closed", "CLIENT_CLOSED");
       }
 
-      const sqlStatements = stmts.map(stmt => {
-        const normalized = this.normalizeStatement(stmt);
-        return normalized.sql; // For now, ignore args in batch
-      });
+      const normalizedStatements = stmts.map(stmt => this.normalizeStatement(stmt));
 
-      const result = await this.session.batch(sqlStatements);
+      // libSQL runs the whole batch as a single atomic transaction. Map the
+      // libSQL transaction mode ("write" implies a write lock) onto the
+      // SQLite locking mode the Hrana batch wraps the statements in;
+      // everything else defaults to a deferred transaction.
+      const batchMode = mode === "write" ? "immediate" : "deferred";
 
-      // Return array of result sets (simplified - actual implementation would be more complex)
-      return [this.convertResult(result)];
+      const results = await this.session.batch(
+        normalizedStatements,
+        batchMode,
+        undefined,
+        this._defaultSafeIntegers,
+      );
+
+      return results.map((result: any) => this.convertResult(result));
     } catch (error: any) {
       if (error instanceof LibsqlError) {
         throw error;

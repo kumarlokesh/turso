@@ -53,6 +53,62 @@ function toBindArgs(params) {
   return [params];
 }
 
+/**
+ * Builds a libSQL-style `Row` from a positional value array and its column
+ * names. The row exposes every value both positionally (`row[0]`) and by
+ * column name (`row.name`); `length` reports the column count and is
+ * non-enumerable so it does not appear as a row value.
+ */
+function makeBatchRow(columnNames: string[], values: any[]): any {
+  // Back the row with a real array so positional access (`row[0]`) and
+  // `length` come for free, then layer column names on top as
+  // non-enumerable properties so they don't show up as extra values.
+  const row: any = [...values];
+  for (let i = 0; i < columnNames.length; i++) {
+    const name = columnNames[i];
+    // Skip names that would collide with array internals (indices, length).
+    if (!name || name === "length" || /^\d+$/.test(name)) {
+      continue;
+    }
+    Object.defineProperty(row, name, {
+      value: values[i],
+      enumerable: false,
+      writable: false,
+      configurable: true,
+    });
+  }
+  return row;
+}
+
+/**
+ * Builds a libSQL-style `ResultSet` for a single statement in a `batch()`.
+ */
+function makeResultSet(
+  columns: string[],
+  columnTypes: string[],
+  rows: any[],
+  rowsAffected: number,
+  lastInsertRowid: bigint | undefined,
+): ResultSet {
+  return {
+    columns,
+    columnTypes,
+    rows,
+    rowsAffected,
+    lastInsertRowid,
+    toJSON() {
+      return {
+        columns: this.columns,
+        columnTypes: this.columnTypes,
+        rows: this.rows,
+        rowsAffected: this.rowsAffected,
+        // JSON has no BigInt; serialize the rowid as a string (or undefined).
+        lastInsertRowid: this.lastInsertRowid?.toString(),
+      };
+    },
+  };
+}
+
 
 /**
  * Locking mode for `Database.batch(stmts, mode)` and the variants of
@@ -60,6 +116,36 @@ function toBindArgs(params) {
  * wrapped in `BEGIN <mode>` / `COMMIT` (with `ROLLBACK` on failure).
  */
 export type BatchMode = "deferred" | "immediate" | "exclusive" | "concurrent";
+
+/**
+ * A single result row returned from `batch()`. Mirrors the libSQL `Row`:
+ * each value is accessible both positionally (`row[0]`) and by column name
+ * (`row.name`), and `length` reports the column count.
+ */
+export interface Row {
+  length: number;
+  [index: number]: any;
+  [name: string]: any;
+}
+
+/**
+ * The result of executing a single statement within `batch()`, matching the
+ * libSQL client's `ResultSet` shape.
+ */
+export interface ResultSet {
+  /** Column names of the result, empty for statements that return no rows. */
+  columns: Array<string>;
+  /** Declared column types, parallel to `columns`. */
+  columnTypes: Array<string>;
+  /** Result rows; empty for non-SELECT statements. */
+  rows: Array<Row>;
+  /** Number of rows changed by the statement (0 for SELECT). */
+  rowsAffected: number;
+  /** Rowid of the inserted row for INSERTs, `undefined` otherwise. */
+  lastInsertRowid: bigint | undefined;
+  /** Returns a JSON-friendly plain object (rowid serialized as a string). */
+  toJSON(): any;
+}
 
 /**
  * A wrapped transaction function. Calling it runs the wrapped function inside a
@@ -210,8 +296,10 @@ class Database {
    * @param mode - When set, wraps the batch in `BEGIN <mode>` / `COMMIT`
    *   (with `ROLLBACK` on failure). Ignored when already inside a
    *   transaction.
-   * @returns An object with `rowsAffected` (sum of affected rows) and
-   *   `lastInsertRowid` (rowid of the last successful insert).
+   * @returns An array of `ResultSet`s — one per input statement, in order —
+   *   matching the libSQL client contract. Each `ResultSet` carries that
+   *   statement's `columns`, `columnTypes`, `rows`, `rowsAffected`, and
+   *   `lastInsertRowid`.
    *
    * @example
    * // Plain SQL strings (non-atomic).
@@ -245,7 +333,7 @@ class Database {
   async batch(
     statements: Array<string | { sql: string; args?: any[] | Record<string, any> }>,
     mode?: BatchMode,
-  ): Promise<{ rowsAffected: number; lastInsertRowid: number | bigint | undefined }> {
+  ): Promise<ResultSet[]> {
     if (!Array.isArray(statements)) {
       throw new TypeError("Expected first argument to be an array of statements");
     }
@@ -285,8 +373,7 @@ class Database {
         this._inTransaction = true;
       }
 
-      let rowsAffected = 0;
-      let lastInsertRowid: number | bigint | undefined;
+      const results: ResultSet[] = [];
       try {
         for (const statement of statements) {
           const sql = typeof statement === "string" ? statement : statement.sql;
@@ -302,8 +389,16 @@ class Database {
             if (args !== undefined) {
               bindParams(nativeStmt, [args]);
             }
+            const cols = nativeStmt.columns();
+            const columnNames = cols.map((c) => c.name);
+            const columnTypes = cols.map((c) => c.type ?? "");
+            // Read rows as positional value arrays so the resulting Row can
+            // expose both positional and named access.
+            nativeStmt.raw(true);
+
             const totalChangesBefore = this.db.totalChanges();
             const lastInsertRowidBefore = this.db.lastInsertRowid();
+            const rows: any[] = [];
             try {
               while (true) {
                 const stepResult = await nativeStmt.stepSync();
@@ -314,21 +409,24 @@ class Database {
                 if (stepResult === STEP_DONE) {
                   break;
                 }
-                // STEP_ROW results are discarded; batch() does not
-                // surface rows.
+                // STEP_ROW: surface the row in the statement's ResultSet.
+                rows.push(makeBatchRow(columnNames, nativeStmt.row()));
               }
-              if (this.db.totalChanges() !== totalChangesBefore) {
-                rowsAffected += this.db.changes();
-              }
+              const rowsAffected =
+                this.db.totalChanges() !== totalChangesBefore ? this.db.changes() : 0;
               // SQLite keeps last_insert_rowid() sticky across
               // non-INSERT statements, so just checking the value is
               // not enough — UPDATE/DELETE would inherit a stale
               // rowid. Use the delta as the per-statement INSERT
-              // signal.
+              // signal, and surface it as a BigInt to match libSQL.
               const lastInsertRowidAfter = this.db.lastInsertRowid();
-              if (lastInsertRowidAfter !== lastInsertRowidBefore) {
-                lastInsertRowid = lastInsertRowidAfter;
-              }
+              const lastInsertRowid =
+                lastInsertRowidAfter !== lastInsertRowidBefore
+                  ? BigInt(lastInsertRowidAfter)
+                  : undefined;
+              results.push(
+                makeResultSet(columnNames, columnTypes, rows, rowsAffected, lastInsertRowid),
+              );
             } finally {
               nativeStmt.reset();
             }
@@ -348,7 +446,7 @@ class Database {
         }
         throw err;
       }
-      return { rowsAffected, lastInsertRowid };
+      return results;
     } finally {
       this.execLock.release();
     }
