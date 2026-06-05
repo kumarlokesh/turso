@@ -41,7 +41,7 @@ members = [
     "testing/differential-oracle/sql_gen",
     "testing/differential-oracle/fuzzer",
     "testing/sqltests",
-	"testing/sync-fuzzer"
+    "testing/sync-fuzzer"
 ]
 exclude = ["perf/latency/limbo"]
 
@@ -82,7 +82,6 @@ default-members = [
     "testing/differential-oracle/sql_gen",
     "testing/differential-oracle/fuzzer",
     "testing/sqltests",
-	"testing/sync-fuzzer"
 ]
 
 [workspace.package]
