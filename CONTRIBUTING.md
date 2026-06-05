@@ -413,6 +413,30 @@ And launch an Antithesis test run with:
 scripts/antithesis/launch.sh
 ```
 
+## Annotating intent with Aristo
+
+Turso uses [Aristo](https://github.com/aretta-ai/aristo) to capture design intent that the code alone doesn't spell out — invariants a refactor could silently break — as `#[aristo::intent("...")]` annotations attached to the code. They're optional; reach for one only when a property is invisible from the signature and not already guarded by a test. For example, on the WAL trait in `core/storage/wal.rs`:
+
+```rust
+#[aristo::intent(
+    "An append-only log that records page-level changes before they are \
+     applied to the database, so a system crash can be recovered by \
+     replaying the log.",
+    verify = "neural",
+    id = "wal_records_changes_before_apply",
+)]
+pub trait Wal: Debug + Send + Sync { ... }
+```
+
+The macros are a workspace dependency, so annotated code builds normally. To author and lint annotations, install the CLI:
+
+```console
+cargo install aristo-cli   # provides the `aristo` command
+aristo lint                # lint annotation prose (also runs in CI on every PR)
+```
+
+To machine-check annotations, run `/aristo-neural-verify` in Claude Code.
+
 ## Adding Third Party Dependencies
 
 When you want to add third party dependencies, please follow these steps:
